@@ -1,85 +1,92 @@
 import os
-import socket
 import ipaddress
 import asyncio
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# دالة للطباعة الفورية في سجلات Render
+# دالة للطباعة الفورية
 def log(message):
     print(message, flush=True)
 
-# --- إعدادات خادم الويب لـ Render ---
+# --- خادم الصحة لـ Render ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is alive!")
-    def log_message(self, format, *args):
-        return # لمنع امتلاء السجلات بطلبات فحص الحالة
+        self.wfile.write(b"Bot is alive and fast!")
+    def log_message(self, format, *args): return
 
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    log(f"--- Health check server started on port {port} ---")
     server.serve_forever()
 
-# --- منطق البوت الأساسي ---
+# --- منطق الفحص المسرع ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+MAX_CONCURRENT_SCANS = 100  # عدد الفحوصات المتوازية في نفس اللحظة
 
 async def check_port(ip, port=8080):
+    """فحص المنفذ مع مهلة زمنية قصيرة جداً للسرعة"""
     try:
+        # تقليل الـ timeout لزيادة السرعة (1 ثانية كافية جداً)
         conn = asyncio.open_connection(str(ip), port)
         _, writer = await asyncio.wait_for(conn, timeout=1.0)
         writer.close()
         await writer.wait_closed()
-        return True
+        return str(ip)
     except:
-        return False
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("البوت يعمل! أرسل نطاق CIDR للفحص.")
+        return None
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    log(f"Received request to scan: {text}")
-    await update.message.reply_text("جاري الفحص...")
+    log(f"Scanning: {text}")
+    await update.message.reply_text("🚀 جاري الفحص السريع... يرجى الانتظار.")
     
-    found_ips = []
     try:
         network = ipaddress.ip_network(text, strict=False)
-        for ip in network:
-            if await check_port(ip):
-                found_ips.append(str(ip))
-                if len(found_ips) >= 10:
-                    await update.message.reply_text("\n".join(found_ips))
-                    found_ips = []
+        all_ips = list(network)
+        total = len(all_ips)
+        
+        found_ips = []
+        # تقسيم العمل إلى مجموعات (Batches) لعدم استهلاك موارد السيرفر بالكامل
+        batch_size = MAX_CONCURRENT_SCANS
+        for i in range(0, total, batch_size):
+            batch = all_ips[i:i+batch_size]
+            # تشغيل الفحص لكل المجموعة في نفس اللحظة
+            tasks = [check_port(ip) for ip in batch]
+            results = await asyncio.gather(*tasks)
+            
+            # تصفية النتائج الناجحة
+            successful_scans = [ip for ip in results if ip]
+            found_ips.extend(successful_scans)
+            
+            # إرسال تحديث إذا وجدت نتائج كثيرة لتجنب التأخير
+            if len(found_ips) >= 20:
+                await update.message.reply_text("✅ تم العثور على:\n" + "\n".join(found_ips))
+                found_ips = []
+
+        if found_ips:
+            await update.message.reply_text("✅ النتائج النهائية:\n" + "\n".join(found_ips))
+        else:
+            await update.message.reply_text("🏁 انتهى الفحص السريع.")
+            
     except Exception as e:
         log(f"Error: {e}")
-        await update.message.reply_text(f"خطأ في الصيغة: {e}")
-
-    if found_ips:
-        await update.message.reply_text("النتائج:\n" + "\n".join(found_ips))
-    else:
-        await update.message.reply_text("انتهى الفحص.")
+        await update.message.reply_text(f"❌ خطأ: {e}")
 
 if __name__ == '__main__':
-    log("--- Starting Application ---")
     if not TOKEN:
         log("FATAL ERROR: TELEGRAM_TOKEN is missing!")
         sys.exit(1)
-    else:
-        # تشغيل خادم الصحة
-        threading.Thread(target=run_health_check_server, daemon=True).start()
-        
-        # تشغيل البوت
-        log("Initializing Telegram Bot...")
-        application = ApplicationBuilder().token(TOKEN).build()
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-        
-        log("Bot is polling now...")
-        application.run_polling()
+    
+    threading.Thread(target=run_health_check_server, daemon=True).start()
+    
+    application = ApplicationBuilder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start := lambda u, c: u.message.reply_text("أرسل CIDR للفحص السريع!")))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    log("Fast Bot is running...")
+    application.run_polling()
