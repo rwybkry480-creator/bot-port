@@ -4,20 +4,27 @@ import ipaddress
 import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
+import sys
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+
+# دالة للطباعة الفورية في سجلات Render
+def log(message):
+    print(message, flush=True)
 
 # --- إعدادات خادم الويب لـ Render ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running!")
+        self.wfile.write(b"Bot is alive!")
+    def log_message(self, format, *args):
+        return # لمنع امتلاء السجلات بطلبات فحص الحالة
 
 def run_health_check_server():
-    port = int(os.environ.get("PORT", 8080)) # Render يحدد المنفذ تلقائياً
+    port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    print(f"Health check server started on port {port}")
+    log(f"--- Health check server started on port {port} ---")
     server.serve_forever()
 
 # --- منطق البوت الأساسي ---
@@ -34,49 +41,45 @@ async def check_port(ip, port=8080):
         return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "أهلاً بك! أرسل لي نطاقات CIDR وسأفحص المنفذ 8080."
-    )
+    await update.message.reply_text("البوت يعمل! أرسل نطاق CIDR للفحص.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    lines = text.split('\n')
-    await update.message.reply_text("جاري الفحص... يرجى الانتظار.")
+    log(f"Received request to scan: {text}")
+    await update.message.reply_text("جاري الفحص...")
     
     found_ips = []
-    for line in lines:
-        try:
-            network = ipaddress.ip_network(line.strip(), strict=False)
-            for ip in network:
-                if await check_port(ip):
-                    found_ips.append(str(ip))
-                    if len(found_ips) >= 10:
-                        await update.message.reply_text("\n".join(found_ips))
-                        found_ips = []
-        except ValueError:
-            try:
-                ip = ipaddress.ip_address(line.strip())
-                if await check_port(ip):
-                    found_ips.append(str(ip))
-            except ValueError:
-                continue
+    try:
+        network = ipaddress.ip_network(text, strict=False)
+        for ip in network:
+            if await check_port(ip):
+                found_ips.append(str(ip))
+                if len(found_ips) >= 10:
+                    await update.message.reply_text("\n".join(found_ips))
+                    found_ips = []
+    except Exception as e:
+        log(f"Error: {e}")
+        await update.message.reply_text(f"خطأ في الصيغة: {e}")
 
     if found_ips:
         await update.message.reply_text("النتائج:\n" + "\n".join(found_ips))
     else:
-        await update.message.reply_text("انتهى الفحص ولم يتم العثور على نتائج.")
+        await update.message.reply_text("انتهى الفحص.")
 
 if __name__ == '__main__':
+    log("--- Starting Application ---")
     if not TOKEN:
-        print("Error: TELEGRAM_TOKEN is missing!")
+        log("FATAL ERROR: TELEGRAM_TOKEN is missing!")
+        sys.exit(1)
     else:
-        # تشغيل خادم الصحة في خيط (Thread) منفصل
+        # تشغيل خادم الصحة
         threading.Thread(target=run_health_check_server, daemon=True).start()
         
         # تشغيل البوت
+        log("Initializing Telegram Bot...")
         application = ApplicationBuilder().token(TOKEN).build()
         application.add_handler(CommandHandler("start", start))
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
         
-        print("Bot is starting...")
+        log("Bot is polling now...")
         application.run_polling()
